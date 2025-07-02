@@ -92,7 +92,7 @@ class GameplayTester:
         print(f"Using device: {self.device}")
 
         # Setup environment
-        self.env = gym.make('ALE/MsPacman-v5', render_mode='rgb_array')
+        self.env = gym.make('ALE/Pong-v5', render_mode='rgb_array')
         self.preprocessor = AtariPreprocessor()
 
         # Load trained model
@@ -233,7 +233,7 @@ class GameplayTester:
         paused = False
 
         # Pac-Man action names (may vary by environment version)
-        action_names = ['NOOP', 'UP', 'RIGHT', 'LEFT', 'DOWN', 'UPRIGHT', 'UPLEFT', 'DOWNRIGHT', 'DOWNLEFT']
+        action_names = ['NOOP', 'FIRE', 'RIGHT', 'LEFT', 'RIGHTFIRE', 'LEFTFIRE']
         action_names = action_names[:self.n_actions]  # Trim to actual number of actions
 
         while True:
@@ -274,7 +274,7 @@ def main():
     parser = argparse.ArgumentParser(description='Test DQN Pac-Man Agent')
     parser.add_argument('--model', type=str, default='dqn_pacman_1000.pth',
                         help='Path to saved model')
-    parser.add_argument('--episodes', type=int, default=3,
+    parser.add_argument('--episodes', type=int, default=10,
                         help='Number of episodes to evaluate')
     parser.add_argument('--save-videos', action='store_true',
                         help='Save gameplay videos as GIFs')
