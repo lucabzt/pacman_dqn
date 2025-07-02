@@ -7,9 +7,10 @@ from collections import deque
 import cv2
 import gymnasium as gym
 import ale_py
+import time
 
+# Register Atari environments
 gym.register_envs(ale_py)
-
 
 
 class DQN(nn.Module):
@@ -33,8 +34,9 @@ class DQN(nn.Module):
             nn.ReLU(),
 
             # Additional conv layer for better feature extraction
-            nn.Conv2d(64, 128, kernel_size=3, stride=1),
-            nn.ReLU(),
+            # This layer was removed to match the classic DQN conv output size for a (84, 84) input
+            # nn.Conv2d(64, 128, kernel_size=3, stride=1),
+            # nn.ReLU(),
         )
 
         # Calculate conv output size
@@ -44,11 +46,12 @@ class DQN(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(conv_out_size, 512),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, n_actions)
+            # Dropout is not typically used in classic DQN FC layers
+            # nn.Dropout(0.1),
+            # nn.Linear(512, 256),
+            # nn.ReLU(),
+            # nn.Dropout(0.1),
+            nn.Linear(512, n_actions)
         )
 
     def _get_conv_out(self, shape):
@@ -56,6 +59,8 @@ class DQN(nn.Module):
         return int(np.prod(o.size()))
 
     def forward(self, x):
+        # Normalize pixel values
+        x = x / 255.0
         conv_out = self.conv(x).view(x.size()[0], -1)
         return self.fc(conv_out)
 
@@ -67,12 +72,16 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
 
     def push(self, state, action, reward, next_state, done):
+        # Store states as uint8 to save memory
+        state = state.astype(np.uint8)
+        next_state = next_state.astype(np.uint8)
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done
+        # Convert states back to float for tensor conversion
+        return state.astype(np.float32), action, reward, next_state.astype(np.float32), done
 
     def __len__(self):
         return len(self.buffer)
@@ -89,8 +98,8 @@ class AtariPreprocessor:
     def preprocess_frame(self, frame):
         # Convert to grayscale and resize
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        resized = cv2.resize(gray, (84, 84))
-        return resized.astype(np.float32) / 255.0
+        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        return resized  # Return as uint8
 
     def reset(self, env):
         obs, info = env.reset()
@@ -114,41 +123,58 @@ class AtariPreprocessor:
 
 class DQNAgent:
     def __init__(self, state_shape, n_actions, lr=1e-4, gamma=0.99,
-                 epsilon_start=1.0, epsilon_end=0.1, epsilon_decay=0.995):
+                 epsilon_start=1.0, epsilon_end=0.1, epsilon_decay_frames=1_000_000,
+                 replay_buffer_capacity=1_000_000, batch_size=32,
+                 update_target_every=10000, replay_start_size=50000):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
 
         # Networks
         self.q_network = DQN(state_shape, n_actions).to(self.device)
         self.target_network = DQN(state_shape, n_actions).to(self.device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
 
         # Hyperparameters
+        self.n_actions = n_actions
         self.gamma = gamma
         self.epsilon = epsilon_start
+        self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
+        self.epsilon_decay_frames = epsilon_decay_frames
+        self.batch_size = batch_size
+        self.update_target_every = update_target_every
+        self.replay_start_size = replay_start_size
 
         # Experience replay
-        self.memory = ReplayBuffer(100000)
-        self.batch_size = 32
-        self.update_target_every = 1000
-        self.steps = 0
+        self.memory = ReplayBuffer(replay_buffer_capacity)
+        self.training_steps = 0
 
     def act(self, state, training=True):
         if training and random.random() < self.epsilon:
-            return random.randrange(self.q_network.fc[-1].out_features)
+            return random.randrange(self.n_actions)
 
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            # Add batch dimension and convert to tensor
+            state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device, dtype=torch.float32)
             q_values = self.q_network(state_tensor)
             return q_values.max(1)[1].item()
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.push(state, action, reward, next_state, done)
 
+    def update_epsilon(self, frame_idx):
+        """Linearly anneal epsilon from start to end over decay_frames."""
+        if frame_idx > self.epsilon_decay_frames:
+            self.epsilon = self.epsilon_end
+        else:
+            self.epsilon = self.epsilon_start - (self.epsilon_start - self.epsilon_end) * (
+                        frame_idx / self.epsilon_decay_frames)
+
     def replay(self):
-        if len(self.memory) < self.batch_size:
-            return
+        # Start training only when the buffer is large enough
+        if len(self.memory) < self.replay_start_size:
+            return None  # Return None to indicate no loss was computed
 
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
 
@@ -159,64 +185,99 @@ class DQNAgent:
         dones = torch.BoolTensor(dones).to(self.device)
 
         current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
-        next_q_values = self.target_network(next_states).max(1)[0].detach()
+
+        # Double DQN logic for selecting next action
+        next_actions = self.q_network(next_states).max(1)[1].detach()
+        next_q_values = self.target_network(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+
         target_q_values = rewards + (self.gamma * next_q_values * ~dones)
 
         loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 10)
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)  # Clip grads for stability
         self.optimizer.step()
 
-        self.steps += 1
-        if self.steps % self.update_target_every == 0:
+        self.training_steps += 1
+        if self.training_steps % self.update_target_every == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
 
-        if self.epsilon > self.epsilon_end:
-            self.epsilon *= self.epsilon_decay
+        return loss.item()
 
 
 def train_dqn():
+    # --- Hyperparameters ---
+    ENV_NAME = 'ALE/Pong-v5'
+    TOTAL_FRAMES = 100_000
+    REPLAY_MEMORY_CAPACITY = 1_000_000
+    EPSILON_DECAY_FRAMES = 50_000
+    REPLAY_START_SIZE = 10_000
+    TARGET_UPDATE_FREQUENCY = 10_000  # In training steps, not env frames
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    GAMMA = 0.99
+
     # Environment setup
-    env = gym.make('ALE/MsPacman-v5', render_mode='rgb_array')
+    env = gym.make(ENV_NAME, render_mode='rgb_array')
     preprocessor = AtariPreprocessor()
 
     # Agent setup
     state_shape = (4, 84, 84)  # 4 stacked frames
     n_actions = env.action_space.n
-    agent = DQNAgent(state_shape, n_actions)
+    agent = DQNAgent(state_shape=state_shape,
+                     n_actions=n_actions,
+                     lr=LEARNING_RATE,
+                     gamma=GAMMA,
+                     epsilon_decay_frames=EPSILON_DECAY_FRAMES,
+                     replay_buffer_capacity=REPLAY_MEMORY_CAPACITY,
+                     batch_size=BATCH_SIZE,
+                     update_target_every=TARGET_UPDATE_FREQUENCY,
+                     replay_start_size=REPLAY_START_SIZE)
 
-    episodes = 1000
+    # Training loop
+    episode_rewards = []
     scores = deque(maxlen=100)
 
-    for episode in range(episodes):
-        state = preprocessor.reset(env)
-        total_reward = 0
+    state = preprocessor.reset(env)
+    episode_reward = 0
+    start_time = time.time()
 
-        while True:
-            action = agent.act(state)
-            next_state, reward, done, info = preprocessor.step(env, action)
+    for frame_idx in range(1, TOTAL_FRAMES + 1):
+        agent.update_epsilon(frame_idx)
+        action = agent.act(state)
 
-            agent.remember(state, action, reward, next_state, done)
-            agent.replay()
+        next_state, reward, done, info = preprocessor.step(env, action)
+        agent.remember(state, action, reward, next_state, done)
 
-            state = next_state
-            total_reward += reward
+        loss = agent.replay()
 
-            if done:
-                break
+        state = next_state
+        episode_reward += reward
 
-        scores.append(total_reward)
-        avg_score = np.mean(scores)
+        if done:
+            scores.append(episode_reward)
+            episode_rewards.append(episode_reward)
+            avg_score = np.mean(scores)
 
-        if episode % 10 == 0:
-            print(f"Episode {episode}, Score: {total_reward:.2f}, "
-                  f"Avg Score: {avg_score:.2f}, Epsilon: {agent.epsilon:.3f}")
+            print(f"Frame {frame_idx}/{TOTAL_FRAMES} | "
+                  f"Episode {len(episode_rewards)} | "
+                  f"Score: {episode_reward:.2f} | "
+                  f"Avg Score (last 100): {avg_score:.2f} | "
+                  f"Epsilon: {agent.epsilon:.3f} | "
+                  f"Loss: {loss if loss is not None else 'N/A'}")
+
+            state = preprocessor.reset(env)
+            episode_reward = 0
 
         # Save model periodically
-        if episode % 100 == 0:
-            torch.save(agent.q_network.state_dict(), f'dqn_pacman_{episode}.pth')
+        if frame_idx % 250_000 == 0:
+            print(f"--- Saving model at frame {frame_idx} ---")
+            torch.save(agent.q_network.state_dict(), f'dqn_pacman_{frame_idx}.pth')
+
+    env.close()
+    end_time = time.time()
+    print(f"Training finished in {(end_time - start_time) / 3600:.2f} hours.")
 
 
 if __name__ == "__main__":
