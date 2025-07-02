@@ -8,6 +8,7 @@ import cv2
 import gymnasium as gym
 import ale_py
 import time
+import matplotlib.pyplot as plt  # Added for plotting
 
 # Register Atari environments
 gym.register_envs(ale_py)
@@ -169,7 +170,7 @@ class DQNAgent:
             self.epsilon = self.epsilon_end
         else:
             self.epsilon = self.epsilon_start - (self.epsilon_start - self.epsilon_end) * (
-                        frame_idx / self.epsilon_decay_frames)
+                    frame_idx / self.epsilon_decay_frames)
 
     def replay(self):
         # Start training only when the buffer is large enough
@@ -187,10 +188,11 @@ class DQNAgent:
         current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
 
         # Double DQN logic for selecting next action
-        next_actions = self.q_network(next_states).max(1)[1].detach()
-        next_q_values = self.target_network(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            next_actions = self.q_network(next_states).max(1)[1]
+            next_q_values = self.target_network(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
 
-        target_q_values = rewards + (self.gamma * next_q_values * ~dones)
+            target_q_values = rewards + (self.gamma * next_q_values * ~dones)
 
         loss = nn.MSELoss()(current_q_values.squeeze(), target_q_values)
 
@@ -204,6 +206,35 @@ class DQNAgent:
             self.target_network.load_state_dict(self.q_network.state_dict())
 
         return loss.item()
+
+def plot_and_save_rewards(frame_indices, rewards, filename="dqn_rewards_plot.png"):
+    """Plots episode rewards and a 100-episode moving average, then saves the plot."""
+    if not rewards:
+        print("No episodes completed, skipping plot generation.")
+        return
+
+    plt.figure(figsize=(12, 6))
+    plt.title("Episode Rewards Over Time")
+    plt.xlabel("Total Frames")
+    plt.ylabel("Episode Reward")
+
+    # Calculate 100-episode moving average
+    moving_avg = []
+    for i in range(len(rewards)):
+        start_idx = max(0, i - 99)
+        moving_avg.append(np.mean(rewards[start_idx:i + 1]))
+
+    #plt.plot(frame_indices, rewards, label="Episode Reward", alpha=0.7, zorder=1)
+    plt.plot(frame_indices, moving_avg, label="100-Episode Moving Average", color='red', linewidth=2, zorder=2)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    try:
+        plt.savefig(filename)
+        print(f"\nReward plot saved to {filename}")
+    except Exception as e:
+        print(f"Error saving plot: {e}")
+    plt.close()
 
 
 def train_dqn():
@@ -235,50 +266,63 @@ def train_dqn():
                      update_target_every=TARGET_UPDATE_FREQUENCY,
                      replay_start_size=REPLAY_START_SIZE)
 
-    # Training loop
-    episode_rewards = []
+    # --- Training loop ---
     scores = deque(maxlen=100)
+    # Lists to store data for the final plot
+    plot_episode_rewards = []
+    plot_episode_frames = []
 
     state = preprocessor.reset(env)
     episode_reward = 0
     start_time = time.time()
 
-    for frame_idx in range(1, TOTAL_FRAMES + 1):
-        agent.update_epsilon(frame_idx)
-        action = agent.act(state)
+    try:
+        for frame_idx in range(1, TOTAL_FRAMES + 1):
+            agent.update_epsilon(frame_idx)
+            action = agent.act(state)
 
-        next_state, reward, done, info = preprocessor.step(env, action)
-        agent.remember(state, action, reward, next_state, done)
+            next_state, reward, done, info = preprocessor.step(env, action)
+            agent.remember(state, action, reward, next_state, done)
 
-        loss = agent.replay()
+            loss = agent.replay()
 
-        state = next_state
-        episode_reward += reward
+            state = next_state
+            episode_reward += reward
 
-        if done:
-            scores.append(episode_reward)
-            episode_rewards.append(episode_reward)
-            avg_score = np.mean(scores)
+            if done:
+                scores.append(episode_reward)
+                # Store data for plotting
+                plot_episode_rewards.append(episode_reward)
+                plot_episode_frames.append(frame_idx)
+                avg_score = np.mean(scores)
 
-            print(f"Frame {frame_idx}/{TOTAL_FRAMES} | "
-                  f"Episode {len(episode_rewards)} | "
-                  f"Score: {episode_reward:.2f} | "
-                  f"Avg Score (last 100): {avg_score:.2f} | "
-                  f"Epsilon: {agent.epsilon:.3f} | "
-                  f"Loss: {loss if loss is not None else 'N/A'}")
+                print(f"Frame {frame_idx}/{TOTAL_FRAMES} | "
+                      f"Episode {len(plot_episode_rewards)} | "
+                      f"Score: {episode_reward:.2f} | "
+                      f"Avg Score (last 100): {avg_score:.2f} | "
+                      f"Epsilon: {agent.epsilon:.3f} | "
+                      f"Loss: {loss if loss is not None else 'N/A'}")
 
-            state = preprocessor.reset(env)
-            episode_reward = 0
+                state = preprocessor.reset(env)
+                episode_reward = 0
 
-        # Save model periodically
-        if frame_idx % 250_000 == 0:
-            print(f"--- Saving model at frame {frame_idx} ---")
-            torch.save(agent.q_network.state_dict(), f'dqn_pacman_{frame_idx}.pth')
+            # Save model periodically
+            if frame_idx % 250_000 == 0:
+                print(f"--- Saving model at frame {frame_idx} ---")
+                # Corrected name to match environment
+                torch.save(agent.q_network.state_dict(), f'dqn_pong_{frame_idx}.pth')
 
-    env.close()
-    end_time = time.time()
-    print(f"Training finished in {(end_time - start_time) / 3600:.2f} hours.")
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+    finally:
+        # This block will run whether the loop finishes or is interrupted
+        env.close()
+        end_time = time.time()
+        print(f"Training finished or interrupted after {(end_time - start_time) / 3600:.2f} hours.")
+        # Generate and save the reward plot
+        plot_and_save_rewards(plot_episode_frames, plot_episode_rewards)
 
 
 if __name__ == "__main__":
+    # Ensure you have matplotlib installed: pip install matplotlib
     train_dqn()
